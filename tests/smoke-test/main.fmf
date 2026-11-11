@@ -1,2 +1,5 @@
-summary: Smoke test that enclave reports its version
-test: enclave --version
+/smoke:
+    summary: Smoke test that enclave reports its version 
+    test: enclave --version
+/fail: 
+    test: echo "this test always fails"; exit 1
