@@ -23,9 +23,21 @@
 #
 # Usage: tests/backend-lifecycle/smoke-backend-lifecycle.sh [step...]
 #        (no args = all steps)
+# For repeat local tmt runs as the same non-root user, set
+# ENCLAVE_TMT_PODMAN_DATA_DIR to an absolute, dedicated directory to keep images.
 set -u
 
 if [ "${ENCLAVE_TMT_TEST:-}" = 1 ]; then
+  if [ -n "${ENCLAVE_TMT_PODMAN_DATA_DIR:-}" ]; then
+    case "$ENCLAVE_TMT_PODMAN_DATA_DIR" in
+      /*) ;;
+      *) echo "ENCLAVE_TMT_PODMAN_DATA_DIR must be absolute" >&2; exit 1 ;;
+    esac
+    if [ "$(id -u)" -eq 0 ] || [ "${ENCLAVE_TMT_DEDICATED_USER:-}" = 1 ]; then
+      echo "Podman image reuse requires a persistent non-root test user" >&2
+      exit 1
+    fi
+  fi
   test_root=$(mktemp -d /var/tmp/enclave-lifecycle.XXXXXX)
   cleanup_tmt() {
     if [ "${ENCLAVE_TMT_DEDICATED_USER:-}" = 1 ]; then
@@ -43,7 +55,7 @@ if [ "${ENCLAVE_TMT_TEST:-}" = 1 ]; then
   export XDG_CONFIG_HOME="$test_root/config"
   export XDG_STATE_HOME="$test_root/state"
   export XDG_CACHE_HOME="$test_root/cache"
-  export XDG_DATA_HOME="$test_root/data"
+  export XDG_DATA_HOME="${ENCLAVE_TMT_PODMAN_DATA_DIR:-$test_root/data}"
   export SMOKE_ROOT="$test_root/smoke"
   export CLI_BIN=/usr/bin/enclave
   export ENGINE=podman

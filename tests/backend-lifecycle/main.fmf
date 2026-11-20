@@ -50,5 +50,6 @@ test: |
     cd "$test_root"
     runuser -u "$test_user" -- env -u ENCLAVE_ALLOW_ROOT \
         HOME="$test_root" XDG_RUNTIME_DIR="/run/user/$test_uid" \
+        DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$test_uid/bus" \
         ENCLAVE_TMT_TEST=1 ENCLAVE_TMT_DEDICATED_USER=1 \
         ./smoke-backend-lifecycle.sh
