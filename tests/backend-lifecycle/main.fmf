@@ -8,12 +8,13 @@
 summary: Exercise sandbox lifecycle and network isolation
 enabled: false
 path: /backend-lifecycle
+framework: beakerlib
 duration: 30m
 require:
     - enclave
     - podman
     - curl
-    - python3
+    - /usr/bin/script
     - /usr/sbin/runuser
     - /usr/sbin/useradd
     - /usr/bin/newuidmap
@@ -21,9 +22,9 @@ require:
     - /usr/bin/loginctl
     - /usr/bin/systemctl
     - passt
+# The enabled tests below select step functions in smoke-backend-lifecycle.sh.
 test: |
     set -eu
-    export ENCLAVE_TMT_TEST=1
     if [ "$(id -u)" -ne 0 ]; then
         export ENCLAVE_TMT_SHARED_PODMAN_DATA_DIR="${ENCLAVE_TMT_PODMAN_DATA_DIR:-$TMT_PLAN_DATA/podman-data}"
         unset ENCLAVE_TMT_PODMAN_DATA_DIR
@@ -33,10 +34,10 @@ test: |
     test_root=$(cat "$TMT_PLAN_DATA/enclave-tmt-root")
     test_user="enclavetmt${test_root##*.}"
     test_uid=$(id -u "$test_user")
+    chown -R "$test_user" "$BEAKERLIB_DIR"
     runuser -u "$test_user" -- env -u ENCLAVE_ALLOW_ROOT \
         HOME="$test_root" XDG_RUNTIME_DIR="/run/user/$test_uid" \
         DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$test_uid/bus" \
-        ENCLAVE_TMT_TEST=1 ENCLAVE_TMT_DEDICATED_USER=1 \
         ENCLAVE_TMT_SHARED_PODMAN_DATA_DIR="$test_root/podman-data" \
         "$test_root/smoke-backend-lifecycle.sh" $ENCLAVE_TMT_STEPS
 
@@ -56,13 +57,16 @@ test: |
     summary: Synchronize, share, and reset authentication and environment
     enabled: true
     environment:
-        ENCLAVE_TMT_STEPS: fg_auth_sync cross_project bg_stop_finalize exec_sync persisted_env reset_auth
+        ENCLAVE_TMT_STEPS: >-
+            foreground_auth_sync cross_project_auth background_stop_auth
+            exec_auth_sync persistent_environment reset_auth
 
 /sessions:
     summary: List, restart, and run ephemeral sessions
     enabled: true
     environment:
-        ENCLAVE_TMT_STEPS: ps ephemeral restart_stopped
+        ENCLAVE_TMT_STEPS: >-
+            list_sessions ephemeral restart_stopped
 
 /network-status:
     summary: Report gateway status

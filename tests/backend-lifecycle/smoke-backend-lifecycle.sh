@@ -9,160 +9,95 @@
 # Live smoke tests for the isolation-backend store/auth lifecycle: session
 # auth survival across foreground/background/exec, reset and ephemeral store
 # handling, feature auth, restricted networking, and the network log of
-# unrestricted sessions. Requires a Docker daemon (or podman, with
-# ENGINE=podman) and network access; builds the claude tool and gateway images
-# on first use and runs real containers.
+# unrestricted sessions. Runs under tmt with rootless Podman.
 #
 # Lifecycle steps run unrestricted with --disable-gateway so they do not depend
 # on the gateway; the network steps cover it.
 #
-# DESTRUCTIVE within its scope: exercises --reset-auth against the shared
-# claude auth store and writes fake credentials there. Run it only on a
-# machine whose host-directory claude/github-cli auth stores (under
-# ~/.local/state/enclave/) hold no real credentials.
-#
-# Usage: tests/backend-lifecycle/smoke-backend-lifecycle.sh [step...]
-#        (no args = all steps)
-# For repeat local tmt runs as the same non-root user, set
-# ENCLAVE_TMT_PODMAN_DATA_DIR to an absolute, dedicated directory to keep images.
-set -u
+# shellcheck source=/dev/null
+. /usr/share/beakerlib/beakerlib.sh || exit 1
+rlJournalStart || exit 1
 
-if [ "${ENCLAVE_TMT_TEST:-}" = 1 ]; then
-  if [ -n "${ENCLAVE_TMT_PODMAN_DATA_DIR:-}" ]; then
-    case "$ENCLAVE_TMT_PODMAN_DATA_DIR" in
-      /*) ;;
-      *) echo "ENCLAVE_TMT_PODMAN_DATA_DIR must be absolute" >&2; exit 1 ;;
-    esac
-    if [ "$(id -u)" -eq 0 ] || [ "${ENCLAVE_TMT_DEDICATED_USER:-}" = 1 ]; then
-      echo "Podman image reuse requires a persistent non-root test user" >&2
-      exit 1
-    fi
-  fi
-  if [ -n "${ENCLAVE_TMT_SHARED_PODMAN_DATA_DIR:-}" ]; then
-    case "$ENCLAVE_TMT_SHARED_PODMAN_DATA_DIR" in
-      /*) ;;
-      *) echo "shared Podman data directory must be absolute" >&2; exit 1 ;;
-    esac
-  fi
-  test_root=$(mktemp -d /var/tmp/enclave-lifecycle.XXXXXX)
-  cleanup_tmt() {
-    if [ "${ENCLAVE_TMT_DEDICATED_USER:-}" = 1 ] && [ -z "${ENCLAVE_TMT_SHARED_PODMAN_DATA_DIR:-}" ]; then
-      podman system reset --force || true
-      podman system migrate || true
-    fi
-    rm -rf "$test_root"
-  }
-  trap cleanup_tmt EXIT
-  mkdir -p "$test_root/home" "$test_root/config/enclave" "$test_root/state" \
-    "$test_root/cache" "$test_root/data"
-  printf '{"backend":"podman","tool":"claude"}\n' > "$test_root/config/enclave/config.json"
-  printf '[user]\n\tname = Enclave Smoke Test\n\temail = smoke@example.invalid\n' > "$test_root/home/.gitconfig"
-  export HOME="$test_root/home"
-  export XDG_CONFIG_HOME="$test_root/config"
-  export XDG_STATE_HOME="$test_root/state"
-  export XDG_CACHE_HOME="$test_root/cache"
-  export XDG_DATA_HOME="${ENCLAVE_TMT_SHARED_PODMAN_DATA_DIR:-${ENCLAVE_TMT_PODMAN_DATA_DIR:-$test_root/data}}"
-  export SMOKE_ROOT="$test_root/smoke"
-  export CLI_BIN=/usr/bin/enclave
-  export ENGINE=podman
-fi
+case "${ENCLAVE_TMT_SHARED_PODMAN_DATA_DIR:-}" in
+  /*) ;;
+  *) echo "shared Podman data directory must be absolute" >&2; exit 1 ;;
+esac
+test_root=$(mktemp -d /var/tmp/enclave-lifecycle.XXXXXX) || exit 1
+trap 'rm -rf "$test_root"' EXIT
+mkdir -p "$test_root/home" "$test_root/config/enclave" "$test_root/state" \
+  "$test_root/cache" || exit 1
+printf '{"backend":"podman","tool":"claude"}\n' > "$test_root/config/enclave/config.json"
+printf '[user]\n\tname = Enclave Smoke Test\n\temail = smoke@example.invalid\n' > "$test_root/home/.gitconfig"
+export HOME="$test_root/home"
+export XDG_CONFIG_HOME="$test_root/config"
+export XDG_STATE_HOME="$test_root/state"
+export XDG_CACHE_HOME="$test_root/cache"
+export XDG_DATA_HOME="$ENCLAVE_TMT_SHARED_PODMAN_DATA_DIR"
+CLI_BIN=/usr/bin/enclave
+PROJECTS_ROOT="$test_root/smoke"
+PROJECT=$PROJECTS_ROOT/project1
+OTHER_PROJECT=$PROJECTS_ROOT/project2
 
-REPO_ROOT=$(cd "$(dirname "$0")/../.." && pwd)
-CLI_BIN=${CLI_BIN:-$REPO_ROOT/bin/enclave}
-ENGINE=${ENGINE:-docker}
-# Outside home: enclave refuses to mount hidden home directories. Stable across
-# invocations, so steps run separately share their projects.
-SMOKE_ROOT=${SMOKE_ROOT:-${TMPDIR:-/tmp}/enclave-smoke-$(id -u)}
-P1=$SMOKE_ROOT/project1
-P2=$SMOKE_ROOT/project2
+FOREGROUND_CREDENTIALS='{"claudeAiOauth":{"expiresAt":300}}'
+BACKGROUND_CREDENTIALS='{"claudeAiOauth":{"expiresAt":400}}'
+EXEC_CREDENTIALS='{"claudeAiOauth":{"expiresAt":500}}'
+GITHUB_HOSTS='github.com: {user: smoke}'
 
-CRED300='{"claudeAiOauth":{"expiresAt":300}}'
-CRED400='{"claudeAiOauth":{"expiresAt":400}}'
-CRED500='{"claudeAiOauth":{"expiresAt":500}}'
-GHHOSTS='github.com: {user: smoke}'
+fail() { rlFail "$*"; exit 1; }
 
-pass() { echo "PASS: $*"; }
-fail() { echo "FAIL: $*"; exit 1; }
-
-[ -x "$CLI_BIN" ] || fail "enclave binary not found at $CLI_BIN (run make build)"
-mkdir -p "$P1" "$P2"
-echo smoke1 > "$P1/README.md"
-echo smoke2 > "$P2/README.md"
+[ -x "$CLI_BIN" ] || fail "enclave binary not found at $CLI_BIN"
+mkdir -p "$PROJECT" "$OTHER_PROJECT"
+echo smoke1 > "$PROJECT/README.md"
+echo smoke2 > "$OTHER_PROJECT/README.md"
 
 # run_tty <dir> <enclave args...> — run enclave under a pty, capture output.
 run_tty() {
   local dir=$1; shift
+  local cmd
+  cmd=$(printf '%q ' "$CLI_BIN" "$@")
   (
     cd "$dir" || exit
-    python3 - "$CLI_BIN" "$@" <<'PY'
-import errno
-import os
-import pty
-import sys
-
-pid, fd = pty.fork()
-if pid == 0:
-    os.execvp(sys.argv[1], sys.argv[1:])
-
-while True:
-    try:
-        output = os.read(fd, 65536)
-    except OSError as error:
-        if error.errno == errno.EIO:
-            break
-        raise
-    if not output:
-        break
-    os.write(sys.stdout.fileno(), output)
-    if os.environ.get("ENCLAVE_SMOKE_TRACE") == "1":
-        os.write(sys.stderr.fileno(), output)
-
-_, status = os.waitpid(pid, 0)
-sys.exit(os.waitstatus_to_exitcode(status))
-PY
+    if [ "${ENCLAVE_SMOKE_TRACE:-}" = 1 ]; then
+      set -o pipefail
+      SHELL=/bin/bash script -qec "$cmd" /dev/null 2>&1 | tee /dev/stderr
+    else
+      SHELL=/bin/bash script -qec "$cmd" /dev/null 2>&1
+    fi
   )
 }
 
-# Persistent stores are host directories under the XDG state root, read
-# and written directly from the host filesystem — no Docker volumes.
-storecat() { cat "$1/$2" 2>/dev/null; }
-storehas() { [ -e "$1/$2" ]; }
+# Persistent stores are host directories under the XDG state root.
+read_store_file() { cat "$1/$2" 2>/dev/null; }
+store_file_exists() { [ -e "$1/$2" ]; }
 
-hash_for() { (cd "$1" && "$CLI_BIN" info --tool claude 2>/dev/null | awk '/Project Hash:/ {print $3}'); }
+project_hash_for() { (cd "$1" && "$CLI_BIN" info --tool claude 2>/dev/null | awk '/Project Hash:/ {print $3}'); }
 
-H1=$(hash_for "$P1")
-[ -n "$H1" ] || fail "could not resolve project hash for $P1"
-STATE_ROOT="${XDG_STATE_HOME:-$HOME/.local/state}/enclave"
-ENV1="$STATE_ROOT/projects/${H1}/claude/env"
-NETLOG1="$STATE_ROOT/projects/${H1}/claude/logs/network.log"
-AUTH="$STATE_ROOT/tools/claude/auth/default"
-GHAUTH="$STATE_ROOT/features/github-cli/auth"
+PROJECT_HASH=$(project_hash_for "$PROJECT")
+[ -n "$PROJECT_HASH" ] || fail "could not resolve project hash for $PROJECT"
+STATE_ROOT="$XDG_STATE_HOME/enclave"
+ENV_STORE="$STATE_ROOT/projects/${PROJECT_HASH}/claude/env"
+NETWORK_LOG="$STATE_ROOT/projects/${PROJECT_HASH}/claude/logs/network.log"
+AUTH_STORE="$STATE_ROOT/tools/claude/auth/default"
+GITHUB_AUTH_STORE="$STATE_ROOT/features/github-cli/auth"
 
 step_baseline() {
-  out=$(ENCLAVE_SMOKE_TRACE="${ENCLAVE_TMT_TEST:-0}" run_tty "$P1" shell --allow-all-network --disable-gateway -- -c 'echo smoke-baseline-ok')
+  out=$(ENCLAVE_SMOKE_TRACE=1 run_tty "$PROJECT" shell --allow-all-network --disable-gateway -- -c 'echo smoke-baseline-ok')
   echo "$out" | grep -q smoke-baseline-ok || fail "baseline: shell run did not echo (output: $out)"
-  pass "baseline foreground shell run"
+  rlPass "baseline foreground shell run"
 }
 
 step_filesystem_isolation() {
-  local host_file project_file config_file output status
-  if [ "$(uname -s)" = Darwin ]; then
-    config_file="$HOME/Library/Application Support/org.eclipse.enclave/config/config.json"
-  else
-    case "${XDG_CONFIG_HOME:-}" in
-      /*) config_file="$XDG_CONFIG_HOME/enclave/config.json" ;;
-      *) config_file="$HOME/.config/enclave/config.json" ;;
-    esac
-  fi
+  local host_file project_file output status
+  local config_file="$XDG_CONFIG_HOME/enclave/config.json"
   [ -f "$config_file" ] || fail "filesystem: host enclave config not found at $config_file"
-  host_file=$(mktemp "$SMOKE_ROOT/host-only.XXXXXX") || fail "filesystem: cannot create host canary"
-  project_file=$(mktemp "$P1/.filesystem-check.XXXXXX") || {
+  host_file=$(mktemp "$PROJECTS_ROOT/host-only.XXXXXX") || fail "filesystem: cannot create host canary"
+  project_file=$(mktemp "$PROJECT/.filesystem-check.XXXXXX") || {
     rm -f "$host_file"
     fail "filesystem: cannot create project canary"
   }
   printf 'host-only\n' > "$host_file"
   chmod 644 "$host_file"
-  output=$(run_tty "$P1" shell --allow-all-network --disable-gateway -- -c '
+  output=$(run_tty "$PROJECT" shell --allow-all-network --disable-gateway -- -c '
     if [ -e "$1" ] || [ -L "$1" ]; then
       echo "host-only file is visible"
       exit 1
@@ -180,32 +115,32 @@ step_filesystem_isolation() {
     fail "filesystem: isolation or project write check failed (exit $status, output: $output)"
   fi
   rm -f "$host_file" "$project_file"
-  pass "project is writable; host-only file and enclave config are inaccessible"
+  rlPass "project is writable; host-only file and enclave config are inaccessible"
 }
 
-step_fg_auth_sync() {
-  out=$(run_tty "$P1" shell --allow-all-network --disable-gateway -- -c "
+step_foreground_auth_sync() {
+  out=$(run_tty "$PROJECT" shell --allow-all-network --disable-gateway -- -c "
     echo \"securestorage=\$CLAUDE_SECURESTORAGE_CONFIG_DIR\"
-    printf '%s' '$CRED300' > ~/.claude/.credentials.json
+    printf '%s' '$FOREGROUND_CREDENTIALS' > ~/.claude/.credentials.json
     mkdir -p ~/.claude/.config/gh
-    printf '%s' '$GHHOSTS' > ~/.claude/.config/gh/hosts.yml
+    printf '%s' '$GITHUB_HOSTS' > ~/.claude/.config/gh/hosts.yml
     echo wrote-creds
   ")
   echo "$out" | grep -q "wrote-creds" || fail "fg: session did not write creds ($out)"
   echo "$out" | grep -q "securestorage=/home/agent/.enclave-auth" || fail "fg: securestorage env missing ($out)"
-  got=$(storecat "$AUTH" .credentials.json)
-  [ "$got" = "$CRED300" ] || fail "fg: shared auth not synced post-run (got: $got)"
-  gotgh=$(storecat "$GHAUTH" hosts.yml)
-  [ "$gotgh" = "$GHHOSTS" ] || fail "fg: gh feature auth not synced post-run (got: $gotgh)"
-  pass "foreground run synced shared auth + gh feature auth on exit (auto-remove path)"
+  got=$(read_store_file "$AUTH_STORE" .credentials.json)
+  rlAssertEquals "foreground credentials synced" "$FOREGROUND_CREDENTIALS" "$got" || return 1
+  gotgh=$(read_store_file "$GITHUB_AUTH_STORE" hosts.yml)
+  rlAssertEquals "GitHub credentials synced" "$GITHUB_HOSTS" "$gotgh" || return 1
+  rlPass "foreground run synced shared auth + gh feature auth on exit (auto-remove path)"
 }
 
-step_cross_project() {
+step_cross_project_auth() {
   # The onboarding marker may live in config.json (fresh store: written by the
   # OnAuthReady hook) or in .claude.json (steady state: the entrypoint links
   # config-dir auth files into the shared auth mount and claude reads
   # ~/.claude.json). Assert the functional outcome, not one specific file.
-  out=$(run_tty "$P2" shell --allow-all-network --disable-gateway -- -c '
+  out=$(run_tty "$OTHER_PROJECT" shell --allow-all-network --disable-gateway -- -c '
     cat ~/.claude/config.json 2>/dev/null
     cat ~/.claude.json 2>/dev/null
     echo ---
@@ -214,117 +149,117 @@ step_cross_project() {
   echo "$out" | grep -q "Credentials: Subscription/session is present" || fail "cross: shared session not detected ($out)"
   echo "$out" | grep -q hasCompletedOnboarding || fail "cross: onboarding marker missing ($out)"
   echo "$out" | grep -q '"expiresAt":300' || fail "cross: shared credential not visible in second project ($out)"
-  pass "second project sees shared session; onboarding marker present"
+  rlPass "second project sees shared session; onboarding marker present"
 }
 
-step_bg_stop_finalize() {
-  run_tty "$P1" run --background --name smokebg --allow-all-network --disable-gateway >/dev/null
-  local name="enclave-claude-${H1}-smokebg"
-  "$ENGINE" ps --format '{{.Names}}' | grep -qx "$name" || fail "bg: container $name not running"
-  "$ENGINE" exec "$name" bash -c "printf '%s' '$CRED400' > ~/.claude/.credentials.json" || fail "bg: exec write failed"
+step_background_stop_auth() {
+  run_tty "$PROJECT" run --background --name smokebg --allow-all-network --disable-gateway >/dev/null
+  local name="enclave-claude-${PROJECT_HASH}-smokebg"
+  podman ps --format '{{.Names}}' | grep -qx "$name" || fail "bg: container $name not running"
+  podman exec "$name" bash -c "printf '%s' '$BACKGROUND_CREDENTIALS' > ~/.claude/.credentials.json" || fail "bg: exec write failed"
   "$CLI_BIN" stop "$name" >/dev/null 2>&1
-  "$ENGINE" ps -a --format '{{.Names}}' | grep -qx "$name" && fail "bg: container not removed by stop"
-  got=$(storecat "$AUTH" .credentials.json)
-  [ "$got" = "$CRED400" ] || fail "bg: stop finalize did not reconcile newer cred (got: $got)"
-  pass "background stop finalized auth (cred400 reconciled) and removed container"
+  podman ps -a --format '{{.Names}}' | grep -qx "$name" && fail "bg: container not removed by stop"
+  got=$(read_store_file "$AUTH_STORE" .credentials.json)
+  rlAssertEquals "background credentials synced on stop" "$BACKGROUND_CREDENTIALS" "$got" || return 1
+  rlPass "background stop finalized auth (cred400 reconciled) and removed container"
 }
 
-step_exec_sync() {
-  run_tty "$P1" run --background --name smokexec --allow-all-network --disable-gateway >/dev/null
-  local name="enclave-claude-${H1}-smokexec"
-  "$ENGINE" ps --format '{{.Names}}' | grep -qx "$name" || fail "exec: container $name not running"
-  run_tty "$P1" exec --name smokexec -- bash -c "printf '%s' '$CRED500' > ~/.claude/.credentials.json && echo exec-done" | grep -q exec-done || fail "exec: command failed"
-  got=$(storecat "$AUTH" .credentials.json)
-  [ "$got" = "$CRED500" ] || fail "exec: credentials not synced immediately after exec (got: $got)"
+step_exec_auth_sync() {
+  run_tty "$PROJECT" run --background --name smokexec --allow-all-network --disable-gateway >/dev/null
+  local name="enclave-claude-${PROJECT_HASH}-smokexec"
+  podman ps --format '{{.Names}}' | grep -qx "$name" || fail "exec: container $name not running"
+  run_tty "$PROJECT" exec --name smokexec -- bash -c "printf '%s' '$EXEC_CREDENTIALS' > ~/.claude/.credentials.json && echo exec-done" | grep -q exec-done || fail "exec: command failed"
+  got=$(read_store_file "$AUTH_STORE" .credentials.json)
+  rlAssertEquals "exec credentials synced immediately" "$EXEC_CREDENTIALS" "$got" || return 1
   # The exec'd command's exit status must survive the backend seam to the CLI.
-  run_tty "$P1" exec --name smokexec -- bash -c 'exit 7' >/dev/null
+  run_tty "$PROJECT" exec --name smokexec -- bash -c 'exit 7' >/dev/null
   code=$?
-  [ "$code" = 7 ] || fail "exec: exit status not preserved (got $code, want 7)"
+  rlAssertEquals "exec exit status preserved" 7 "$code" || return 1
   "$CLI_BIN" stop "$name" >/dev/null 2>&1
-  pass "exec synced credentials immediately and preserved the command's exit status"
+  rlPass "exec synced credentials immediately and preserved the command's exit status"
 }
 
-step_ps() {
-  run_tty "$P1" run --background --name smokeps --allow-all-network --disable-gateway >/dev/null
-  local name="enclave-claude-${H1}-smokeps"
+step_list_sessions() {
+  run_tty "$PROJECT" run --background --name smokeps --allow-all-network --disable-gateway >/dev/null
+  local name="enclave-claude-${PROJECT_HASH}-smokeps"
   "$CLI_BIN" ps 2>/dev/null | grep -q smokeps || fail "ps: session not listed"
   "$CLI_BIN" stop "$name" >/dev/null 2>&1
-  pass "ps lists background session"
+  rlPass "ps lists background session"
 }
 
-step_persisted_env() {
-  out=$(SMOKE_TOKEN=tokenA run_tty "$P1" shell --allow-all-network --disable-gateway --pass-env SMOKE_TOKEN -- -c 'echo "token=$SMOKE_TOKEN"')
+step_persistent_environment() {
+  out=$(SMOKE_TOKEN=tokenA run_tty "$PROJECT" shell --allow-all-network --disable-gateway --pass-env SMOKE_TOKEN -- -c 'echo "token=$SMOKE_TOKEN"')
   echo "$out" | grep -q "token=tokenA" || fail "env: pass-env did not inject ($out)"
-  storehas "$ENV1" env || fail "env: persisted env file missing"
-  storecat "$ENV1" env | grep -q "SMOKE_TOKEN=tokenA" || fail "env: token not persisted"
+  rlAssertExists "$ENV_STORE/env" || return 1
+  rlAssertGrep "SMOKE_TOKEN=tokenA" "$ENV_STORE/env" || return 1
   # New process without the host var: injected from the persisted env store.
-  out=$(run_tty "$P1" shell --allow-all-network --disable-gateway --pass-env SMOKE_TOKEN -- -c 'echo "token=$SMOKE_TOKEN"')
+  out=$(run_tty "$PROJECT" shell --allow-all-network --disable-gateway --pass-env SMOKE_TOKEN -- -c 'echo "token=$SMOKE_TOKEN"')
   echo "$out" | grep -q "token=tokenA" || fail "env: persisted token not re-injected ($out)"
-  pass "persisted env survives across runs"
+  rlPass "persisted env survives across runs"
 }
 
 step_reset_auth() {
-  out=$(run_tty "$P1" shell --allow-all-network --disable-gateway --reset-auth -- -c '
+  out=$(run_tty "$PROJECT" shell --allow-all-network --disable-gateway --reset-auth -- -c '
     ls ~/.claude/.credentials.json 2>&1
     ls ~/.enclave-auth/.credentials.json 2>&1
   ')
   echo "$out" | grep -c "No such file" | grep -q 2 || fail "reset: auth files still present in session ($out)"
-  storehas "$AUTH" .credentials.json && fail "reset: shared auth file survived --reset-auth"
+  rlAssertNotExists "$AUTH_STORE/.credentials.json" || return 1
   # Reset drops previously persisted values; the same run may legitimately
   # re-persist secrets that are live in the host environment (GH_TOKEN etc.),
   # so assert the old token is gone rather than the file being absent.
-  if storehas "$ENV1" env; then
-    storecat "$ENV1" env | grep -q SMOKE_TOKEN && fail "reset: persisted SMOKE_TOKEN survived --reset-auth"
+  if store_file_exists "$ENV_STORE" env; then
+    read_store_file "$ENV_STORE" env | grep -q SMOKE_TOKEN && fail "reset: persisted SMOKE_TOKEN survived --reset-auth"
   fi
-  pass "--reset-auth cleared config+shared auth files and dropped persisted values"
+  rlPass "--reset-auth cleared config+shared auth files and dropped persisted values"
 }
 
 step_ephemeral() {
   # Stores are host directories, so an ephemeral session must not create
-  # any Docker volume. Assert the volume set is unchanged across the run.
-  before=$("$ENGINE" volume ls -q | sort)
-  out=$(run_tty "$P1" shell --allow-all-network --disable-gateway --ephemeral -- -c 'echo eph-ok')
+  # any Podman volume. Assert the volume set is unchanged across the run.
+  before=$(podman volume ls -q | sort)
+  out=$(run_tty "$PROJECT" shell --allow-all-network --disable-gateway --ephemeral -- -c 'echo eph-ok')
   echo "$out" | grep -q eph-ok || fail "ephemeral: run failed ($out)"
   sleep 2
-  after=$("$ENGINE" volume ls -q | sort)
+  after=$(podman volume ls -q | sort)
   [ "$before" = "$after" ] || fail "ephemeral: volume set changed: $(diff <(echo "$before") <(echo "$after"))"
-  pass "ephemeral session ran with a unique config store and created no Docker volumes"
+  rlPass "ephemeral session ran with a unique config store and created no Podman volumes"
 }
 
 step_restart_stopped() {
-  run_tty "$P1" run --background --name smokerestart --allow-all-network --disable-gateway >/dev/null
-  local name="enclave-claude-${H1}-smokerestart"
-  "$ENGINE" stop -t 2 "$name" >/dev/null 2>&1 || fail "restart: $ENGINE stop failed"
-  out=$(run_tty "$P1" run --background --name smokerestart --allow-all-network --disable-gateway)
+  run_tty "$PROJECT" run --background --name smokerestart --allow-all-network --disable-gateway >/dev/null
+  local name="enclave-claude-${PROJECT_HASH}-smokerestart"
+  podman stop -t 2 "$name" >/dev/null 2>&1 || fail "restart: podman stop failed"
+  out=$(run_tty "$PROJECT" run --background --name smokerestart --allow-all-network --disable-gateway)
   echo "$out" | grep -q "Removing stopped container" || fail "restart: pre-start removal not logged ($out)"
-  "$ENGINE" ps --format '{{.Names}}' | grep -qx "$name" || fail "restart: session not running again"
+  podman ps --format '{{.Names}}' | grep -qx "$name" || fail "restart: session not running again"
   "$CLI_BIN" stop "$name" >/dev/null 2>&1
-  pass "stopped session container replaced on restart"
+  rlPass "stopped session container replaced on restart"
 }
 
 step_network_status() {
-  out=$(cd "$P1" && "$CLI_BIN" network status 2>&1)
+  out=$(cd "$PROJECT" && "$CLI_BIN" network status 2>&1)
   echo "$out" | grep -q "no running gateways matched" || fail "network: unexpected status output ($out)"
-  pass "network status runs through the backend gateway manager"
+  rlPass "network status runs through the backend gateway manager"
 }
 
 step_restricted_network() {
-  out=$(run_tty "$P1" shell -- -c '
+  out=$(run_tty "$PROJECT" shell -- -c '
     echo -n allowed=; curl -s -o /dev/null -w "%{http_code}" --max-time 15 https://api.anthropic.com/ || echo -n curl-fail; echo
     echo -n blocked=; curl -s -o /dev/null -w "%{http_code}" --max-time 8 https://example.com/ || echo -n curl-fail; echo
   ')
   echo "$out" | grep -q "allowed=[2345]" || fail "restricted: allowlisted domain unreachable ($out)"
   echo "$out" | grep -Eq "blocked=(000|curl-fail)" || fail "restricted: blocked domain was reachable ($out)"
-  pass "restricted networking enforced through the gateway"
+  rlPass "restricted networking enforced through the gateway"
 }
 
 # netlog_size — current byte size of project1's claude network log (0 if absent).
-netlog_size() { wc -c 2>/dev/null < "$NETLOG1" || echo 0; }
+netlog_size() { wc -c 2>/dev/null < "$NETWORK_LOG" || echo 0; }
 
 # curl_example <enclave args...> — curl https://example.com from a session in
 # project1 and print "reached=<status>" or "reached=curl-fail".
 curl_example() {
-  run_tty "$P1" shell "$@" -- -c '
+  run_tty "$PROJECT" shell "$@" -- -c '
     echo -n reached=; curl -s -o /dev/null -w "%{http_code}" --max-time 15 https://example.com/ || echo -n curl-fail; echo
   '
 }
@@ -336,11 +271,11 @@ step_unrestricted_network_log() {
   before=$(netlog_size)
   out=$(curl_example --allow-all-network)
   echo "$out" | grep -q "reached=[2345]" || fail "unrestricted: non-allowlisted domain unreachable through the observing gateway ($out)"
-  new=$(tail -c +$((before + 1)) "$NETLOG1" 2>/dev/null)
+  new=$(tail -c +$((before + 1)) "$NETWORK_LOG" 2>/dev/null)
   echo "$new" | grep '"type":"session"' -q || fail "unrestricted: no session marker written (new log lines: $new)"
   echo "$new" | grep '"domain":"example.com"' | grep -q '"rule":"unrestricted"' \
     || fail "unrestricted: no network event for example.com (new log lines: $new)"
-  pass "unrestricted session reached a non-allowlisted domain and logged it"
+  rlPass "unrestricted session reached a non-allowlisted domain and logged it"
 }
 
 step_disabled_gateway() {
@@ -351,26 +286,32 @@ step_disabled_gateway() {
   after=$(netlog_size)
   [ "$before" = "$after" ] || fail "disabled gateway: network log grew ($before -> $after bytes)"
   # Assumes the persisted network policy mode is restricted, like restricted_network.
-  out=$(run_tty "$P1" shell --disable-gateway -- -c 'echo ran-restricted')
+  out=$(run_tty "$PROJECT" shell --disable-gateway -- -c 'echo ran-restricted')
   echo "$out" | grep -q ran-restricted && fail "disabled gateway: restricted run with --disable-gateway was accepted ($out)"
   echo "$out" | grep -q "requires unrestricted network mode" || fail "disabled gateway: unexpected restricted-mode error ($out)"
-  pass "--disable-gateway runs without a gateway or log and is rejected in restricted mode"
+  rlPass "--disable-gateway runs without a gateway or log and is rejected in restricted mode"
 }
 
 step_unrestricted_hostname() {
   local args
   for args in "--allow-all-network" "--allow-all-network --disable-gateway"; do
     # shellcheck disable=SC2086
-    out=$(run_tty "$P1" shell $args -- -c 'echo "hostname=$(hostname)"')
+    out=$(run_tty "$PROJECT" shell $args -- -c 'echo "hostname=$(hostname)"')
     echo "$out" | grep -q "hostname=enclave-project1" || fail "hostname: $args session lost its hostname ($out)"
   done
-  pass "unrestricted sessions keep their hostname with and without a gateway"
+  rlPass "unrestricted sessions keep their hostname with and without a gateway"
 }
 
-ALL="baseline filesystem_isolation fg_auth_sync cross_project bg_stop_finalize exec_sync ps persisted_env reset_auth ephemeral restart_stopped network_status restricted_network unrestricted_network_log unrestricted_hostname disabled_gateway"
-steps=${*:-$ALL}
-for s in $steps; do
-  echo "=== step: $s ==="
-  "step_$s"
+# Steps in one test share the temporary projects and authentication stores.
+status=0
+for step in "$@"; do
+  rlPhaseStartTest "$step"
+  if ! rlRun "( step_$step )" 0 "$step"; then
+    status=1
+  fi
+  rlPhaseEnd
+  [ "$status" -eq 0 ] || break
 done
-echo "ALL SMOKE STEPS PASSED"
+rlJournalPrintText
+rlJournalEnd
+exit "$status"
