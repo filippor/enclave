@@ -12,7 +12,43 @@ require:
     - podman
     - curl
     - python3
-    - util-linux
+    - /usr/sbin/runuser
+    - /usr/sbin/useradd
+    - /usr/bin/newuidmap
+    - /usr/bin/newgidmap
+    - /usr/bin/loginctl
+    - /usr/bin/systemctl
+    - passt
 environment:
     ENCLAVE_TMT_TEST: "1"
-test: ./smoke-backend-lifecycle.sh
+test: |
+    set -eu
+    if [ "$(id -u)" -ne 0 ]; then
+        exec ./smoke-backend-lifecycle.sh
+    fi
+
+    test_root=$(mktemp -d /tmp/enclave-tmt.XXXXXX)
+    test_user="enclavetmt${test_root##*.}"
+    if ! useradd -M -d "$test_root" -s /bin/bash "$test_user"; then
+        rmdir "$test_root"
+        exit 1
+    fi
+    test_uid=$(id -u "$test_user")
+    cleanup() {
+        loginctl disable-linger "$test_user" || true
+        systemctl stop "user@$test_uid.service" || true
+        userdel "$test_user" || true
+        rm -f "$test_root/smoke-backend-lifecycle.sh"
+        rmdir "$test_root" || true
+    }
+    trap cleanup EXIT
+
+    chown "$test_user" "$test_root"
+    install -m 755 ./smoke-backend-lifecycle.sh "$test_root/smoke-backend-lifecycle.sh"
+    loginctl enable-linger "$test_user"
+    systemctl start "user@$test_uid.service"
+    cd "$test_root"
+    runuser -u "$test_user" -- env -u ENCLAVE_ALLOW_ROOT \
+        HOME="$test_root" XDG_RUNTIME_DIR="/run/user/$test_uid" \
+        ENCLAVE_TMT_TEST=1 ENCLAVE_TMT_DEDICATED_USER=1 \
+        ./smoke-backend-lifecycle.sh

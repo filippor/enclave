@@ -26,8 +26,15 @@
 set -u
 
 if [ "${ENCLAVE_TMT_TEST:-}" = 1 ]; then
-  test_root=$(mktemp -d)
-  trap 'rm -rf "$test_root"' EXIT
+  test_root=$(mktemp -d /var/tmp/enclave-lifecycle.XXXXXX)
+  cleanup_tmt() {
+    if [ "${ENCLAVE_TMT_DEDICATED_USER:-}" = 1 ]; then
+      podman system reset --force || true
+      podman system migrate || true
+    fi
+    rm -rf "$test_root"
+  }
+  trap cleanup_tmt EXIT
   mkdir -p "$test_root/home" "$test_root/config/enclave" "$test_root/state" \
     "$test_root/cache" "$test_root/data"
   printf '{"backend":"podman","tool":"claude"}\n' > "$test_root/config/enclave/config.json"
@@ -38,7 +45,6 @@ if [ "${ENCLAVE_TMT_TEST:-}" = 1 ]; then
   export XDG_CACHE_HOME="$test_root/cache"
   export XDG_DATA_HOME="$test_root/data"
   export SMOKE_ROOT="$test_root/smoke"
-  export ENCLAVE_ALLOW_ROOT=1
   export CLI_BIN=/usr/bin/enclave
   export ENGINE=podman
 fi
@@ -118,6 +124,45 @@ step_baseline() {
   out=$(ENCLAVE_SMOKE_TRACE="${ENCLAVE_TMT_TEST:-0}" run_tty "$P1" shell --allow-all-network --disable-gateway -- -c 'echo smoke-baseline-ok')
   echo "$out" | grep -q smoke-baseline-ok || fail "baseline: shell run did not echo (output: $out)"
   pass "baseline foreground shell run"
+}
+
+step_filesystem_isolation() {
+  local host_file project_file config_file output status
+  if [ "$(uname -s)" = Darwin ]; then
+    config_file="$HOME/Library/Application Support/org.eclipse.enclave/config/config.json"
+  else
+    case "${XDG_CONFIG_HOME:-}" in
+      /*) config_file="$XDG_CONFIG_HOME/enclave/config.json" ;;
+      *) config_file="$HOME/.config/enclave/config.json" ;;
+    esac
+  fi
+  [ -f "$config_file" ] || fail "filesystem: host enclave config not found at $config_file"
+  host_file=$(mktemp "$SMOKE_ROOT/host-only.XXXXXX") || fail "filesystem: cannot create host canary"
+  project_file=$(mktemp "$P1/.filesystem-check.XXXXXX") || {
+    rm -f "$host_file"
+    fail "filesystem: cannot create project canary"
+  }
+  printf 'host-only\n' > "$host_file"
+  chmod 644 "$host_file"
+  output=$(run_tty "$P1" shell --allow-all-network --disable-gateway -- -c '
+    if [ -e "$1" ] || [ -L "$1" ]; then
+      echo "host-only file is visible"
+      exit 1
+    fi
+    if [ -e "$2" ] || [ -L "$2" ]; then
+      echo "host enclave config is visible"
+      exit 1
+    fi
+    printf "container-write\n" > "$3"
+  ' bash "$host_file" "$config_file" "$(basename "$project_file")")
+  status=$?
+  if [ "$status" -ne 0 ] || [ "$(cat "$project_file")" != "container-write" ] ||
+      [ "$(cat "$host_file")" != "host-only" ]; then
+    rm -f "$host_file" "$project_file"
+    fail "filesystem: isolation or project write check failed (exit $status, output: $output)"
+  fi
+  rm -f "$host_file" "$project_file"
+  pass "project is writable; host-only file and enclave config are inaccessible"
 }
 
 step_fg_auth_sync() {
@@ -304,7 +349,7 @@ step_unrestricted_hostname() {
   pass "unrestricted sessions keep their hostname with and without a gateway"
 }
 
-ALL="baseline fg_auth_sync cross_project bg_stop_finalize exec_sync ps persisted_env reset_auth ephemeral restart_stopped network_status restricted_network unrestricted_network_log unrestricted_hostname disabled_gateway"
+ALL="baseline filesystem_isolation fg_auth_sync cross_project bg_stop_finalize exec_sync ps persisted_env reset_auth ephemeral restart_stopped network_status restricted_network unrestricted_network_log unrestricted_hostname disabled_gateway"
 steps=${*:-$ALL}
 for s in $steps; do
   echo "=== step: $s ==="
