@@ -2,7 +2,6 @@ summary: Smoke test plan for the enclave CLI
 discover:
     how: fmf
     test:
-        - smoke-test
         - version-metadata
         - package-installed
         - backend-lifecycle

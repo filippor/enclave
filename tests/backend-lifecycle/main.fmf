@@ -6,25 +6,13 @@
 # SPDX-License-Identifier: MIT
 
 summary: Exercise sandbox lifecycle and network isolation
+duration: 30m
 require:
     - enclave
     - podman
     - curl
+    - python3
     - util-linux
-test: |
-    set -eu
-    test_root=$(mktemp -d)
-    trap 'rm -rf "$test_root"' EXIT
-    mkdir -p "$test_root/home" "$test_root/config/enclave"
-    printf '{"backend":"podman"}\n' > "$test_root/config/enclave/config.json"
-
-    HOME="$test_root/home" \
-    XDG_CONFIG_HOME="$test_root/config" \
-    XDG_STATE_HOME="$test_root/state" \
-    XDG_CACHE_HOME="$test_root/cache" \
-    XDG_DATA_HOME="$test_root/data" \
-    SMOKE_ROOT="$test_root/smoke" \
-    ENCLAVE_ALLOW_ROOT=1 \
-    CLI_BIN=/usr/bin/enclave \
-    ENGINE=podman \
-        "$TMT_SOURCE_DIR/backend-lifecycle/smoke-backend-lifecycle.sh"
+environment:
+    ENCLAVE_TMT_TEST: "1"
+test: ./smoke-backend-lifecycle.sh

@@ -8,6 +8,7 @@
 summary: Verify the installed enclave package
 require:
     - enclave
+    - podman
 test: |
     set -e
     test_root=$(mktemp -d)
@@ -21,8 +22,7 @@ test: |
     export XDG_DATA_HOME="$test_root/data"
 
     rpm --query enclave
-    docker --version
-    docker buildx version
+    podman --version
 
     if [ "$(id -u)" -eq 0 ]; then
         if output=$(env -u ENCLAVE_ALLOW_ROOT enclave tools 2>&1); then

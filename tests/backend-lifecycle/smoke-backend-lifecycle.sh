@@ -21,10 +21,29 @@
 # machine whose host-directory claude/github-cli auth stores (under
 # ~/.local/state/enclave/) hold no real credentials.
 #
-# Usage: scripts/smoke-backend-lifecycle.sh [step...]   (no args = all steps)
+# Usage: tests/backend-lifecycle/smoke-backend-lifecycle.sh [step...]
+#        (no args = all steps)
 set -u
 
-REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
+if [ "${ENCLAVE_TMT_TEST:-}" = 1 ]; then
+  test_root=$(mktemp -d)
+  trap 'rm -rf "$test_root"' EXIT
+  mkdir -p "$test_root/home" "$test_root/config/enclave" "$test_root/state" \
+    "$test_root/cache" "$test_root/data"
+  printf '{"backend":"podman","tool":"claude"}\n' > "$test_root/config/enclave/config.json"
+  printf '[user]\n\tname = Enclave Smoke Test\n\temail = smoke@example.invalid\n' > "$test_root/home/.gitconfig"
+  export HOME="$test_root/home"
+  export XDG_CONFIG_HOME="$test_root/config"
+  export XDG_STATE_HOME="$test_root/state"
+  export XDG_CACHE_HOME="$test_root/cache"
+  export XDG_DATA_HOME="$test_root/data"
+  export SMOKE_ROOT="$test_root/smoke"
+  export ENCLAVE_ALLOW_ROOT=1
+  export CLI_BIN=/usr/bin/enclave
+  export ENGINE=podman
+fi
+
+REPO_ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 CLI_BIN=${CLI_BIN:-$REPO_ROOT/bin/enclave}
 ENGINE=${ENGINE:-docker}
 # Outside home: enclave refuses to mount hidden home directories. Stable across
@@ -49,9 +68,35 @@ echo smoke2 > "$P2/README.md"
 # run_tty <dir> <enclave args...> — run enclave under a pty, capture output.
 run_tty() {
   local dir=$1; shift
-  local cmd
-  cmd=$(printf '%q ' "$CLI_BIN" "$@")
-  (cd "$dir" && script -qec "$cmd" /dev/null 2>&1)
+  (
+    cd "$dir" || exit
+    python3 - "$CLI_BIN" "$@" <<'PY'
+import errno
+import os
+import pty
+import sys
+
+pid, fd = pty.fork()
+if pid == 0:
+    os.execvp(sys.argv[1], sys.argv[1:])
+
+while True:
+    try:
+        output = os.read(fd, 65536)
+    except OSError as error:
+        if error.errno == errno.EIO:
+            break
+        raise
+    if not output:
+        break
+    os.write(sys.stdout.fileno(), output)
+    if os.environ.get("ENCLAVE_SMOKE_TRACE") == "1":
+        os.write(sys.stderr.fileno(), output)
+
+_, status = os.waitpid(pid, 0)
+sys.exit(os.waitstatus_to_exitcode(status))
+PY
+  )
 }
 
 # Persistent stores are host directories under the XDG state root, read
@@ -70,7 +115,7 @@ AUTH="$STATE_ROOT/tools/claude/auth/default"
 GHAUTH="$STATE_ROOT/features/github-cli/auth"
 
 step_baseline() {
-  out=$(run_tty "$P1" shell --allow-all-network --disable-gateway -- -c 'echo smoke-baseline-ok')
+  out=$(ENCLAVE_SMOKE_TRACE="${ENCLAVE_TMT_TEST:-0}" run_tty "$P1" shell --allow-all-network --disable-gateway -- -c 'echo smoke-baseline-ok')
   echo "$out" | grep -q smoke-baseline-ok || fail "baseline: shell run did not echo (output: $out)"
   pass "baseline foreground shell run"
 }
