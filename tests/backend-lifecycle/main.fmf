@@ -6,6 +6,8 @@
 # SPDX-License-Identifier: MIT
 
 summary: Exercise sandbox lifecycle and network isolation
+enabled: false
+path: /backend-lifecycle
 duration: 30m
 require:
     - enclave
@@ -19,37 +21,69 @@ require:
     - /usr/bin/loginctl
     - /usr/bin/systemctl
     - passt
-environment:
-    ENCLAVE_TMT_TEST: "1"
 test: |
     set -eu
+    export ENCLAVE_TMT_TEST=1
     if [ "$(id -u)" -ne 0 ]; then
-        exec ./smoke-backend-lifecycle.sh
+        export ENCLAVE_TMT_SHARED_PODMAN_DATA_DIR="${ENCLAVE_TMT_PODMAN_DATA_DIR:-$TMT_PLAN_DATA/podman-data}"
+        unset ENCLAVE_TMT_PODMAN_DATA_DIR
+        exec ./smoke-backend-lifecycle.sh $ENCLAVE_TMT_STEPS
     fi
 
-    test_root=$(mktemp -d /tmp/enclave-tmt.XXXXXX)
+    test_root=$(cat "$TMT_PLAN_DATA/enclave-tmt-root")
     test_user="enclavetmt${test_root##*.}"
-    if ! useradd -M -d "$test_root" -s /bin/bash "$test_user"; then
-        rmdir "$test_root"
-        exit 1
-    fi
     test_uid=$(id -u "$test_user")
-    cleanup() {
-        loginctl disable-linger "$test_user" || true
-        systemctl stop "user@$test_uid.service" || true
-        userdel "$test_user" || true
-        rm -f "$test_root/smoke-backend-lifecycle.sh"
-        rmdir "$test_root" || true
-    }
-    trap cleanup EXIT
-
-    chown "$test_user" "$test_root"
-    install -m 755 ./smoke-backend-lifecycle.sh "$test_root/smoke-backend-lifecycle.sh"
-    loginctl enable-linger "$test_user"
-    systemctl start "user@$test_uid.service"
-    cd "$test_root"
     runuser -u "$test_user" -- env -u ENCLAVE_ALLOW_ROOT \
         HOME="$test_root" XDG_RUNTIME_DIR="/run/user/$test_uid" \
         DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$test_uid/bus" \
         ENCLAVE_TMT_TEST=1 ENCLAVE_TMT_DEDICATED_USER=1 \
-        ./smoke-backend-lifecycle.sh
+        ENCLAVE_TMT_SHARED_PODMAN_DATA_DIR="$test_root/podman-data" \
+        "$test_root/smoke-backend-lifecycle.sh" $ENCLAVE_TMT_STEPS
+
+/baseline:
+    summary: Start a foreground sandbox
+    enabled: true
+    environment:
+        ENCLAVE_TMT_STEPS: baseline
+
+/filesystem:
+    summary: Isolate host files while allowing project writes
+    enabled: true
+    environment:
+        ENCLAVE_TMT_STEPS: filesystem_isolation
+
+/auth:
+    summary: Synchronize, share, and reset authentication and environment
+    enabled: true
+    environment:
+        ENCLAVE_TMT_STEPS: fg_auth_sync cross_project bg_stop_finalize exec_sync persisted_env reset_auth
+
+/sessions:
+    summary: List, restart, and run ephemeral sessions
+    enabled: true
+    environment:
+        ENCLAVE_TMT_STEPS: ps ephemeral restart_stopped
+
+/network-status:
+    summary: Report gateway status
+    enabled: true
+    environment:
+        ENCLAVE_TMT_STEPS: network_status
+
+/network-restricted:
+    summary: Enforce restricted network policy
+    enabled: true
+    environment:
+        ENCLAVE_TMT_STEPS: restricted_network
+
+/network-unrestricted:
+    summary: Log unrestricted networking and preserve hostnames
+    enabled: true
+    environment:
+        ENCLAVE_TMT_STEPS: unrestricted_network_log unrestricted_hostname
+
+/network-disabled:
+    summary: Disable the gateway only for unrestricted sessions
+    enabled: true
+    environment:
+        ENCLAVE_TMT_STEPS: disabled_gateway

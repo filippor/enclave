@@ -38,9 +38,15 @@ if [ "${ENCLAVE_TMT_TEST:-}" = 1 ]; then
       exit 1
     fi
   fi
+  if [ -n "${ENCLAVE_TMT_SHARED_PODMAN_DATA_DIR:-}" ]; then
+    case "$ENCLAVE_TMT_SHARED_PODMAN_DATA_DIR" in
+      /*) ;;
+      *) echo "shared Podman data directory must be absolute" >&2; exit 1 ;;
+    esac
+  fi
   test_root=$(mktemp -d /var/tmp/enclave-lifecycle.XXXXXX)
   cleanup_tmt() {
-    if [ "${ENCLAVE_TMT_DEDICATED_USER:-}" = 1 ]; then
+    if [ "${ENCLAVE_TMT_DEDICATED_USER:-}" = 1 ] && [ -z "${ENCLAVE_TMT_SHARED_PODMAN_DATA_DIR:-}" ]; then
       podman system reset --force || true
       podman system migrate || true
     fi
@@ -55,7 +61,7 @@ if [ "${ENCLAVE_TMT_TEST:-}" = 1 ]; then
   export XDG_CONFIG_HOME="$test_root/config"
   export XDG_STATE_HOME="$test_root/state"
   export XDG_CACHE_HOME="$test_root/cache"
-  export XDG_DATA_HOME="${ENCLAVE_TMT_PODMAN_DATA_DIR:-$test_root/data}"
+  export XDG_DATA_HOME="${ENCLAVE_TMT_SHARED_PODMAN_DATA_DIR:-${ENCLAVE_TMT_PODMAN_DATA_DIR:-$test_root/data}}"
   export SMOKE_ROOT="$test_root/smoke"
   export CLI_BIN=/usr/bin/enclave
   export ENGINE=podman
