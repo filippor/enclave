@@ -16,6 +16,8 @@ jobs:
     trigger: commit
     identifier: main
     branch: main$
+    owner: filippor
+    project: enclave
     targets:
       - fedora-all
   - job: copr_build
@@ -33,7 +35,7 @@ jobs:
     trigger: release
     identifier: release
     owner: filippor
-    project: tests
+    project: enclave
     targets:
       - fedora-all
 
