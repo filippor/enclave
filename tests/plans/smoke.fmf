@@ -4,5 +4,7 @@ discover:
     test:
         - smoke-test
         - version-metadata
+        - package-installed
+        - backend-lifecycle
 execute:
     how: tmt

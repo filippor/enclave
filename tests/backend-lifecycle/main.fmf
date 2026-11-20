@@ -1,0 +1,30 @@
+# Copyright (C) 2026 EclipseSource GmbH and others.
+#
+# This program and the accompanying materials are made available under the
+# terms of the MIT License, which is available in the project root.
+#
+# SPDX-License-Identifier: MIT
+
+summary: Exercise sandbox lifecycle and network isolation
+require:
+    - enclave
+    - podman
+    - curl
+    - util-linux
+test: |
+    set -eu
+    test_root=$(mktemp -d)
+    trap 'rm -rf "$test_root"' EXIT
+    mkdir -p "$test_root/home" "$test_root/config/enclave"
+    printf '{"backend":"podman"}\n' > "$test_root/config/enclave/config.json"
+
+    HOME="$test_root/home" \
+    XDG_CONFIG_HOME="$test_root/config" \
+    XDG_STATE_HOME="$test_root/state" \
+    XDG_CACHE_HOME="$test_root/cache" \
+    XDG_DATA_HOME="$test_root/data" \
+    SMOKE_ROOT="$test_root/smoke" \
+    ENCLAVE_ALLOW_ROOT=1 \
+    CLI_BIN=/usr/bin/enclave \
+    ENGINE=podman \
+        "$TMT_SOURCE_DIR/backend-lifecycle/smoke-backend-lifecycle.sh"
